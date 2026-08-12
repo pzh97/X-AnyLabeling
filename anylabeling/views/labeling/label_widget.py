@@ -6,6 +6,7 @@ import os
 import os.path as osp
 import re
 import shutil
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -104,6 +105,9 @@ CHECKED_FIELD = "checked"
 FILE_CHECKED_COLOR = "#22A06B"
 FILE_UNCHECKED_COLOR = "#8C98A4"
 CHECKED_FIELD_PATTERN = re.compile(r'"checked"\s*:\s*(true|false)')
+NAS_DAT_V4_ROOT = Path(
+    r"\\Synology_NAS_8\Scanning_DATA\file-service\dat_v4"
+)
 
 
 def _measure_text_width(font_metrics, text):
@@ -183,6 +187,13 @@ class LabelingWidget(LabelDialog):
         self.fn_to_index = {}
         self.cache_auto_label = None
         self.cache_auto_label_group_id = None
+        self.front_cam_dialog = None
+        self.front_cam_scroll_area = None
+        self.front_cam_image_label = None
+        self.front_cam_info_label = None
+        self.front_cam_current_pixmap = None
+        self.front_cam_dir = None
+        self.front_cam_index = None
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -568,6 +579,14 @@ class LabelingWidget(LabelDialog):
             shortcuts["open_prev"],
             "prev",
             self.tr("Open prev image"),
+            enabled=False,
+        )
+        open_matched_front_cam_image = action(
+            self.tr("Open Matched Front-Cam"),
+            self.open_matched_front_cam_image,
+            None,
+            "open",
+            self.tr("Open front-cam image matched by merged index"),
             enabled=False,
         )
         open_next_unchecked_image = action(
@@ -1890,6 +1909,7 @@ class LabelingWidget(LabelDialog):
             zoom_actions=zoom_actions,
             open_next_image=open_next_image,
             open_prev_image=open_prev_image,
+            open_matched_front_cam_image=open_matched_front_cam_image,
             open_next_unchecked_image=open_next_unchecked_image,
             open_prev_unchecked_image=open_prev_unchecked_image,
             open_chatbot=open_chatbot,
@@ -1991,6 +2011,7 @@ class LabelingWidget(LabelDialog):
                 digit_shortcut_9,
                 edit_mode,
                 brightness_contrast,
+                open_matched_front_cam_image,
                 toggle_annotation_checked,
                 shape_manager,
                 loop_thru_labels,
@@ -2049,6 +2070,7 @@ class LabelingWidget(LabelDialog):
                 open_,
                 open_next_image,
                 open_prev_image,
+                open_matched_front_cam_image,
                 open_next_unchecked_image,
                 open_prev_unchecked_image,
                 opendir,
@@ -2234,6 +2256,7 @@ class LabelingWidget(LabelDialog):
             opendir,
             open_next_image,
             open_prev_image,
+            open_matched_front_cam_image,
             save,
             delete_file,
             None,
@@ -5770,6 +5793,12 @@ class LabelingWidget(LabelDialog):
             and event.type() == QtCore.QEvent.Type.Resize
         ):
             self._position_canvas_adjustment()
+        if (
+            self.front_cam_dialog is not None
+            and obj is self.front_cam_dialog
+            and event.type() == QtCore.QEvent.Type.Resize
+        ):
+            self._update_front_cam_viewer_pixmap()
         return super().eventFilter(obj, event)
 
     def brightness_contrast(self, _):
@@ -6264,6 +6293,284 @@ class LabelingWidget(LabelDialog):
         self.filename = filename
         if self.filename and load:
             self.load_file(self.filename)
+
+    def _extract_merged_start_from_filename(self, image_path):
+        basename = osp.basename(image_path)
+        match = re.search(r"merged_(\d+)", basename, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_scan_name_from_filename(self, image_path):
+        basename = osp.splitext(osp.basename(image_path))[0]
+        match = re.search(
+            r"(\d{4}_\d{2}_\d{2}\s\d{2}_\d{2}_\d{2})",
+            basename,
+        )
+        if not match:
+            return None
+        return match.group(1)
+
+    def _build_nas_front_cam_dir(self, image_path):
+        scan_name = self._extract_scan_name_from_filename(image_path)
+        if not scan_name:
+            return None
+
+        date_part = scan_name.split(" ")[0]
+        date_elems = date_part.split("_")
+        if len(date_elems) != 3:
+            return None
+
+        year, month, day = date_elems
+        return NAS_DAT_V4_ROOT / year / month / day / scan_name / "front-cam"
+
+    def _candidate_front_cam_dirs(self, image_path):
+        current_path = Path(image_path)
+        candidates = []
+
+        # Strategy 0 (highest priority): NAS canonical front-cam path.
+        nas_front_cam_dir = self._build_nas_front_cam_dir(image_path)
+        if nas_front_cam_dir is not None:
+            candidates.append(nas_front_cam_dir)
+
+        # Strategy 1: find front-cam as a sibling in current path ancestry.
+        for parent in [current_path.parent, *current_path.parents]:
+            candidate = parent / "front-cam"
+            candidates.append(candidate)
+
+        # Keep insertion order while removing duplicates.
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    def _find_front_cam_image(self, image_path, front_index):
+        if front_index < 0:
+            return None, front_index
+
+        index_candidates = [front_index, front_index - 1, front_index + 1]
+        extension_candidates = (".jpg", ".jpeg", ".png")
+        front_cam_dirs = [
+            p for p in self._candidate_front_cam_dirs(image_path) if p.is_dir()
+        ]
+
+        for idx in index_candidates:
+            if idx < 0:
+                continue
+            for front_cam_dir in front_cam_dirs:
+                stem = f"{idx:05d}"
+                for ext in extension_candidates:
+                    candidate_file = front_cam_dir / f"{stem}{ext}"
+                    if candidate_file.is_file():
+                        return str(candidate_file), idx
+
+        return None, front_index
+
+    def _ensure_front_cam_viewer(self):
+        if self.front_cam_dialog is not None:
+            return
+
+        self.front_cam_dialog = QtWidgets.QDialog(self)
+        self.front_cam_dialog.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.front_cam_dialog.setWindowTitle(self.tr("Front-Cam Viewer"))
+        self.front_cam_dialog.resize(1280, 860)
+
+        main_layout = QVBoxLayout(self.front_cam_dialog)
+
+        self.front_cam_info_label = QLabel("")
+        self.front_cam_info_label.setWordWrap(True)
+        main_layout.addWidget(self.front_cam_info_label)
+
+        self.front_cam_image_label = QLabel("")
+        self.front_cam_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.front_cam_image_label.setScaledContents(False)
+        self.front_cam_image_label.setMinimumSize(640, 360)
+        self.front_cam_image_label.mousePressEvent = (
+            self._front_cam_image_mouse_press_event
+        )
+
+        self.front_cam_scroll_area = QScrollArea(self.front_cam_dialog)
+        self.front_cam_scroll_area.setWidgetResizable(False)
+        self.front_cam_scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.front_cam_scroll_area.setWidget(self.front_cam_image_label)
+        main_layout.addWidget(self.front_cam_scroll_area, 1)
+
+        controls_layout = QHBoxLayout()
+        prev_btn = QPushButton(self.tr("Prev"))
+        next_btn = QPushButton(self.tr("Next"))
+        prev_btn.clicked.connect(lambda: self.browse_front_cam(-1))
+        next_btn.clicked.connect(lambda: self.browse_front_cam(1))
+        controls_layout.addWidget(prev_btn)
+        controls_layout.addWidget(next_btn)
+        main_layout.addLayout(controls_layout)
+
+        QtGui.QShortcut(
+            QtGui.QKeySequence(Qt.Key.Key_Left),
+            self.front_cam_dialog,
+            activated=lambda: self.browse_front_cam(-1),
+        )
+        QtGui.QShortcut(
+            QtGui.QKeySequence(Qt.Key.Key_Right),
+            self.front_cam_dialog,
+            activated=lambda: self.browse_front_cam(1),
+        )
+
+        self.front_cam_dialog.installEventFilter(self)
+
+    def _front_cam_image_mouse_press_event(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.browse_front_cam(1)
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.browse_front_cam(-1)
+            return
+        QLabel.mousePressEvent(self.front_cam_image_label, event)
+
+    def _update_front_cam_viewer_pixmap(self):
+        if (
+            self.front_cam_current_pixmap is None
+            or self.front_cam_scroll_area is None
+            or self.front_cam_image_label is None
+        ):
+            return
+
+        viewport_size = self.front_cam_scroll_area.viewport().size()
+        if viewport_size.width() <= 0 or viewport_size.height() <= 0:
+            return
+
+        original = self.front_cam_current_pixmap
+        target_size = original.size()
+        if (
+            original.width() > viewport_size.width()
+            or original.height() > viewport_size.height()
+        ):
+            target_size = original.size().scaled(
+                viewport_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+
+        shown = original.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.front_cam_image_label.setPixmap(shown)
+        self.front_cam_image_label.resize(shown.size())
+
+    def _show_front_cam_in_viewer(self, file_path, index):
+        self._ensure_front_cam_viewer()
+
+        pixmap = QtGui.QPixmap(file_path)
+        if pixmap.isNull():
+            self.status(self.tr("Failed to load front-cam image"), 5000)
+            return False
+
+        self.front_cam_current_pixmap = pixmap
+        self.front_cam_dir = str(Path(file_path).parent)
+        self.front_cam_index = index
+
+        self.front_cam_info_label.setText(
+            self.tr(
+                "Left click: next | Right click: previous | Arrow keys: navigate\nIndex {0} - {1}"
+            ).format(index, file_path)
+        )
+        self._update_front_cam_viewer_pixmap()
+
+        self.front_cam_dialog.show()
+        self.front_cam_dialog.raise_()
+        self.front_cam_dialog.activateWindow()
+        return True
+
+    def _find_front_cam_in_direction(self, front_cam_dir, start_index, step):
+        if step == 0:
+            return None, None
+
+        extension_candidates = (".jpg", ".jpeg", ".png")
+        current = start_index
+
+        for _ in range(5000):
+            if current < 0:
+                return None, None
+
+            stem = f"{current:05d}"
+            for ext in extension_candidates:
+                candidate = Path(front_cam_dir) / f"{stem}{ext}"
+                if candidate.is_file():
+                    return str(candidate), current
+
+            current += step
+
+        return None, None
+
+    def browse_front_cam(self, step):
+        if self.front_cam_dir is None or self.front_cam_index is None:
+            self.status(self.tr("Open a matched front-cam image first"), 4000)
+            return
+
+        start_index = self.front_cam_index + (1 if step > 0 else -1)
+        target_file, target_index = self._find_front_cam_in_direction(
+            self.front_cam_dir,
+            start_index,
+            1 if step > 0 else -1,
+        )
+        if target_file is None:
+            self.status(self.tr("No more front-cam images in this direction"), 4000)
+            return
+
+        self._show_front_cam_in_viewer(target_file, target_index)
+
+    def open_matched_front_cam_image(self, _value=False):
+        if not self.filename:
+            self.status(self.tr("Please open a depth image first"), 3000)
+            return
+
+        merged_start = self._extract_merged_start_from_filename(self.filename)
+        if merged_start is None:
+            self.status(
+                self.tr("Current image name has no merged_<index> segment"),
+                5000,
+            )
+            return
+
+        raw_front_index = round(merged_start / 4000 - 2)
+        front_index = max(0, raw_front_index)
+        front_cam_file, used_index = self._find_front_cam_image(
+            self.filename, front_index
+        )
+
+        if front_cam_file is None:
+            self.status(
+                self.tr("No matching front-cam image found for index {0}").format(
+                    front_index
+                ),
+                6000,
+            )
+            return
+
+        if not self._show_front_cam_in_viewer(front_cam_file, used_index):
+            return
+
+        self.status(
+            self.tr("Opened front-cam index {0}: {1}").format(
+                used_index, osp.basename(front_cam_file)
+            ),
+            5000,
+        )
 
     # File
     def open_file(self, _value=False):
