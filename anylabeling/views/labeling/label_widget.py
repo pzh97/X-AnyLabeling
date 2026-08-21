@@ -91,6 +91,7 @@ from .widgets import (
     LabelModifyDialog,
     GroupIDModifyDialog,
     OverviewDialog,
+    ManualInspectionDialog,
     Popup,
     SearchBar,
     ToolBar,
@@ -194,6 +195,8 @@ class LabelingWidget(LabelDialog):
         self.front_cam_current_pixmap = None
         self.front_cam_dir = None
         self.front_cam_index = None
+        self.manual_inspection_window = None
+        self._manual_inspection_merged_cache = {}
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -1146,6 +1149,13 @@ class LabelingWidget(LabelDialog):
             icon="paddlepaddle",
             tip=self.tr("Open PaddleOCR dialog"),
         )
+        open_manual_inspection = action(
+            self.tr("Manual Inspection"),
+            self.open_manual_inspection,
+            shortcuts.get("open_manual_inspection"),
+            icon="overview",
+            tip=self.tr("Open manual inspection workspace"),
+        )
         documentation = action(
             self.tr("Documentation"),
             self.documentation,
@@ -1918,6 +1928,7 @@ class LabelingWidget(LabelDialog):
             open_classifier=open_image_classifier,
             open_video_classifier=open_video_classifier,
             open_paddleocr=open_paddleocr,
+            open_manual_inspection=open_manual_inspection,
             toggle_auto_labeling_widget=toggle_auto_labeling_widget,
             digit_shortcut_manager=digit_shortcut_manager,
             label_manager=label_manager,
@@ -2104,6 +2115,7 @@ class LabelingWidget(LabelDialog):
                 shape_manager,
                 None,
                 shape_converter,
+                open_manual_inspection,
             ),
         )
         utils.add_actions(
@@ -2287,6 +2299,7 @@ class LabelingWidget(LabelDialog):
             open_image_classifier,
             open_video_classifier,
             open_paddleocr,
+            open_manual_inspection,
             None,
             fit_width,
             zoom,
@@ -3436,6 +3449,216 @@ class LabelingWidget(LabelDialog):
 
     def open_classifier(self):
         return self.open_image_classifier()
+
+    def open_manual_inspection(self):
+        if self.manual_inspection_window is None:
+            self.manual_inspection_window = ManualInspectionDialog(self)
+            self.manual_inspection_window.setAttribute(
+                Qt.WidgetAttribute.WA_DeleteOnClose, False
+            )
+            self.manual_inspection_window.jump_requested.connect(
+                self._on_manual_inspection_jump_requested
+            )
+            self.manual_inspection_window.open_front_cam_requested.connect(
+                self._on_manual_inspection_front_cam_requested
+            )
+
+        if self.manual_inspection_window.isVisible():
+            self.manual_inspection_window.raise_()
+            self.manual_inspection_window.activateWindow()
+        else:
+            self.manual_inspection_window.show()
+
+    def _parse_scan_date_from_scan_name(self, scan_name):
+        match = re.match(
+            r"(?P<year>\d{4})[-_ ](?P<month>\d{2})[-_ ](?P<day>\d{2})",
+            scan_name or "",
+        )
+        if not match:
+            return None
+        return match.group("year"), match.group("month"), match.group("day")
+
+    def _discover_merged_images_from_scan(self, scan_name, dat_home):
+        cache_key = (scan_name or "", dat_home or "")
+        if cache_key in self._manual_inspection_merged_cache:
+            return list(self._manual_inspection_merged_cache[cache_key])
+
+        roots = []
+        if dat_home and scan_name:
+            ymd = self._parse_scan_date_from_scan_name(scan_name)
+            if ymd is not None:
+                year, month, day = ymd
+                root = Path(dat_home) / year / month / day / scan_name
+                if root.is_dir():
+                    roots.append(root)
+
+        if self.filename:
+            current_dir = Path(self.filename).parent
+            if current_dir.is_dir():
+                roots.append(current_dir)
+
+        unique_roots = []
+        seen = set()
+        for root in roots:
+            key = str(root).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_roots.append(root)
+
+        image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+        discovered = []
+        for root in unique_roots:
+            try:
+                for dirpath, _dirnames, filenames in os.walk(str(root)):
+                    for name in filenames:
+                        ext = osp.splitext(name)[1].lower()
+                        if ext not in image_exts:
+                            continue
+                        if "merged_" not in name.lower():
+                            continue
+                        full_path = osp.join(dirpath, name)
+                        if scan_name:
+                            file_scan = self._extract_scan_name_from_filename(
+                                full_path
+                            )
+                            if file_scan and file_scan != scan_name:
+                                continue
+                        discovered.append(full_path)
+            except OSError:
+                continue
+
+        self._manual_inspection_merged_cache[cache_key] = discovered
+        return list(discovered)
+
+    def _build_front_cam_dir_from_scan(self, scan_name, dat_home=None):
+        ymd = self._parse_scan_date_from_scan_name(scan_name)
+        if ymd is None:
+            return None
+        year, month, day = ymd
+
+        roots = []
+        if dat_home:
+            roots.append(Path(dat_home))
+        roots.append(NAS_DAT_V4_ROOT)
+
+        for root in roots:
+            candidate = root / year / month / day / scan_name / "front-cam"
+            if candidate.is_dir():
+                return candidate
+        return None
+
+    def _find_front_cam_by_scan_and_merged_start(
+        self, scan_name, merged_start, dat_home=None
+    ):
+        front_cam_dir = self._build_front_cam_dir_from_scan(scan_name, dat_home)
+        if front_cam_dir is None:
+            return None, None
+
+        # Keep consistent with existing mapping used by open_matched_front_cam_image.
+        raw_front_index = round(merged_start / 4000 - 2)
+        front_index = max(0, raw_front_index)
+
+        index_candidates = [front_index, front_index - 1, front_index + 1]
+        extension_candidates = (".jpg", ".jpeg", ".png")
+
+        for idx in index_candidates:
+            if idx < 0:
+                continue
+            stem = f"{idx:05d}"
+            for ext in extension_candidates:
+                candidate = front_cam_dir / f"{stem}{ext}"
+                if candidate.is_file():
+                    return str(candidate), idx
+
+        return None, front_index
+
+    def _find_closest_merged_image(self, scan_name, merged_start, dat_home=None):
+        candidates = list(self.image_list) if self.image_list else []
+        if self.filename and self.filename not in candidates:
+            candidates.append(self.filename)
+        if not candidates:
+            candidates = []
+
+        discovered = self._discover_merged_images_from_scan(
+            scan_name, dat_home
+        )
+        for path in discovered:
+            if path not in candidates:
+                candidates.append(path)
+
+        if not candidates:
+            return None
+
+        def _best_match(paths, require_scan):
+            best_path = None
+            best_score = None
+            for image_path in paths:
+                merged_value = self._extract_merged_start_from_filename(image_path)
+                if merged_value is None:
+                    continue
+
+                if require_scan and scan_name:
+                    file_scan = self._extract_scan_name_from_filename(image_path)
+                    if file_scan != scan_name:
+                        continue
+
+                score = abs(merged_value - merged_start)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_path = image_path
+            return best_path
+
+        match = _best_match(candidates, require_scan=True)
+        if match is not None:
+            return match
+        return _best_match(candidates, require_scan=False)
+
+    def _on_manual_inspection_jump_requested(
+        self, scan_name, merged_start, dat_home
+    ):
+        target = self._find_closest_merged_image(
+            scan_name, merged_start, dat_home
+        )
+        if target is None:
+            self.status(
+                self.tr("No merged image found for scan {0} near {1}").format(
+                    scan_name, merged_start
+                ),
+                5000,
+            )
+            return
+
+        self.load_file(target)
+        self.status(
+            self.tr("Jumped to merged image near {0}: {1}").format(
+                merged_start, osp.basename(target)
+            ),
+            5000,
+        )
+
+    def _on_manual_inspection_front_cam_requested(
+        self, scan_name, merged_start, dat_home
+    ):
+        front_cam_file, used_index = self._find_front_cam_by_scan_and_merged_start(
+            scan_name, merged_start, dat_home
+        )
+        if front_cam_file and self._show_front_cam_in_viewer(
+            front_cam_file, used_index
+        ):
+            self.status(
+                self.tr("Opened front-cam index {0}: {1}").format(
+                    used_index, osp.basename(front_cam_file)
+                ),
+                5000,
+            )
+            return
+
+        self._on_manual_inspection_jump_requested(
+            scan_name, merged_start, dat_home
+        )
+        if self.filename:
+            self.open_matched_front_cam_image()
 
     # Help
     def documentation(self):
@@ -6340,6 +6563,14 @@ class LabelingWidget(LabelDialog):
         for parent in [current_path.parent, *current_path.parents]:
             candidate = parent / "front-cam"
             candidates.append(candidate)
+
+        # Strategy 2: flat test-cases layout: <root>/<scan_name>/front-cam
+        # scan_name = self._extract_scan_name_from_filename(image_path)
+        # if scan_name:
+        #     flat_root = Path(
+        #         r"\\Synology_NAS\7. Group Sharing\19_InternAlgorithm\zp\april_data_todo\test_cases"
+        #     )
+        #     candidates.append(flat_root / scan_name / "front-cam")
 
         # Keep insertion order while removing duplicates.
         unique = []
